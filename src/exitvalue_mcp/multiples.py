@@ -1,8 +1,10 @@
 """Lookup logic over the public ExitValue.ai multiples dataset (no MCP imports here).
 
-Data: https://exitvalue.ai/data/multiples.json (CC-BY 4.0). Aggregate medians and
-quartiles of disclosed M&A multiples by sub-vertical x enterprise-value bracket.
-Only cells with n >= the dataset's ``min_cell_n`` are shown; nothing else is invented.
+Data (CC-BY 4.0), aggregate medians and quartiles of disclosed M&A multiples:
+  * https://exitvalue.ai/data/multiples.json          sub-vertical x enterprise-value bracket
+  * https://exitvalue.ai/data/multiples-by-year.json  sub-vertical x deal year
+Only cells with n >= the file's own threshold (``min_cell_n`` / ``min_n_per_cell``) are
+shown; missing cells are reported as gaps, never interpolated or estimated.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from .taxonomy import (
 
 SITE = "https://exitvalue.ai"
 DATA_URL = os.environ.get("EXITVALUE_DATA_URL", f"{SITE}/data/multiples.json")
+TREND_URL = os.environ.get("EXITVALUE_TREND_URL", f"{SITE}/data/multiples-by-year.json")
 CONNECTOR_URL = f"{SITE}/ai-connector"
 HOSTED_MCP_URL = f"{SITE}/api/mcp"
 SOURCE_PHRASE = "a licensed historical M&A database, SEC EDGAR filings and verified press releases"
@@ -41,6 +44,7 @@ BRACKETS = {  # multiples.json key -> label
     "over_500m_ev": "$500M and up",
 }
 METRICS = (("ev_ebitda", "EV/EBITDA"), ("ev_revenue", "EV/Revenue"))
+MAX_COMPARE = 6
 _SUFFIXES = ("-business", "-company", "-companies", "-firm", "-firms", "-shop", "-practice",
              "-practices", "-agency", "-agencies", "-services", "-contractor", "-contractors",
              "-businesses", "s")
@@ -59,6 +63,7 @@ class Dataset:
     """Fetches multiples.json at most once per TTL; serves a stale copy if a refresh fails."""
 
     def __init__(self, fetch: Callable[[], dict] = _fetch_url, ttl: float = CACHE_TTL_SECONDS):
+        """``fetch`` defaults to multiples.json; pass ``lambda: _fetch_url(TREND_URL)`` for the per-year file."""
         self._fetch, self._ttl = fetch, ttl
         self._data: dict | None = None
         self._at = 0.0
@@ -176,9 +181,27 @@ def published_cells(ds: dict, sv: str) -> dict[str, dict]:
     return {b: out[b] for b in BRACKETS if b in out}
 
 
-def _source_line(ds: dict) -> str:
-    return (f"Source: ExitValue.ai analysis of disclosed M&A transactions ({ds.get('source_window', '2018-2026')}) "
-            f"from {SOURCE_PHRASE}. Data CC-BY 4.0: {DATA_URL}")
+def _source_line(ds: dict, url: str = DATA_URL) -> str:
+    window = ds.get("source_window") or "-".join(str(y) for y in (ds.get("year_range") or [2018, 2026]))
+    return (f"Source: ExitValue.ai analysis of disclosed M&A transactions ({window}) "
+            f"from {SOURCE_PHRASE}. Data CC-BY 4.0: {url}")
+
+
+def norm_metric(m: object) -> str | None:
+    """'ev_ebitda' / 'EBITDA' / 'EV/Revenue' -> metric key; None if absent/unknown."""
+    if not m:
+        return None
+    s = _slug(str(m)).replace("-", "_")
+    s = s if s.startswith("ev_") else "ev_" + s
+    return s if s in dict(METRICS) else None
+
+
+def _alias_note(query: str, sv: str) -> str | None:
+    qs = _slug(query)
+    for key, (target, note) in ALIAS_NOTES.items():
+        if target == sv and (qs == key or qs.startswith(key + "-")):
+            return note
+    return None
 
 
 # ── tools ──────────────────────────────────────────────────────────────────
@@ -186,7 +209,8 @@ def _source_line(ds: dict) -> str:
 def list_industries(ds: dict) -> str:
     data = ds.get("data") or {}
     lines = ["Industries covered by ExitValue.ai. Sub-verticals marked * have published multiples in the "
-             "open dataset; pass the id in [brackets] to get_valuation_multiples.", ""]
+             "open dataset; pass the id in [brackets] to get_valuation_multiples, compare_industries or "
+             "get_multiples_trend.", ""]
     for ind, svs in INDUSTRY_TAXONOMY.items():
         subs = [f"{display_name(sv)} [{sv}]" + ("*" if sv in data and published_cells(ds, sv) else "")
                 for sv in svs]
@@ -281,6 +305,153 @@ def get_valuation_multiples(ds: dict, industry: str, size_bracket: str | None = 
     return "\n".join(lines)
 
 
-__all__ = ["Dataset", "list_industries", "get_valuation_multiples", "resolve", "published_cells",
-           "calculator_url", "BRACKETS", "DATA_URL"]
+def compare_industries(ds: dict, industries: list[str] | str, size_bracket: str | None = None,
+                       metric: str | None = None) -> str:
+    """2-6 industries side by side: median/IQR/n of one metric per EV bracket (or one bracket)."""
+    raw = industries.split(",") if isinstance(industries, str) else list(industries or [])
+    queries = [str(q).strip()[:100] for q in raw if str(q).strip()]
+    bracket = norm_bracket(size_bracket)
+    m = norm_metric(metric) or "ev_ebitda"
+    lab = dict(METRICS)[m]
+    min_n = int(ds.get("min_cell_n", 10))
+    if not 2 <= len(queries) <= MAX_COMPARE:
+        return (f"compare_industries needs between 2 and {MAX_COMPARE} industries (got {len(queries)}). "
+                "For a single industry use get_valuation_multiples.\n\n" + cta())
+    scope = f"{BRACKETS[bracket]} enterprise value" if bracket else "by enterprise-value bracket"
+    lines = [f"{lab} multiples compared ({scope}, disclosed deals {ds.get('source_window', '2018-2026')}) "
+             "- ExitValue.ai"]
+    if metric and norm_metric(metric) is None:
+        lines.append(f"Unknown metric '{str(metric)[:30]}'; showing EV/EBITDA (use ev_ebitda or ev_revenue).")
+    seen: set[str] = set()
+    any_data = other_hint = False
+    alt = "ev_revenue" if m == "ev_ebitda" else "ev_ebitda"
+    for q in queries:
+        kind, val = resolve(q)
+        if kind is None:
+            sugg = val or []
+            lines.append(f"- '{q}': no industry matched" + (
+                " (did you mean " + ", ".join(f"{display_name(s)} [{s}]" for s in sugg) + "?)" if sugg else ""))
+            continue
+        if kind == "industry":
+            lines.append(f"- {INDUSTRY_DISPLAY_NAMES[val]} ({val}): this is an industry group, not a "
+                         "sub-vertical; pass a sub-vertical id (see list_industries or get_valuation_multiples).")
+            continue
+        sv = val
+        if sv in seen:
+            lines.append(f"- '{q}': same category as {display_name(sv)} [{sv}] above")
+            continue
+        seen.add(sv)
+        name = display_name(sv)
+        note = _alias_note(q, sv)
+        cells = published_cells(ds, sv)
+        if not cells and sv in PARENT_CATEGORY:
+            p_sv, p_note = PARENT_CATEGORY[sv]
+            if published_cells(ds, p_sv):
+                cells = published_cells(ds, p_sv)
+                note = f"too few deals tagged {name} on their own; figures are for {p_note}"
+        if bracket:
+            cells = {b: c for b, c in cells.items() if b == bracket}
+        suffix = f" [{note.replace('figures below are', 'figures are').rstrip('.')}]" if note else ""
+        parts = [f"{BRACKETS[b]} EV: {_fmt_q(c[m], m)}" for b, c in cells.items() if m in c]
+        if not parts:
+            if any(alt in c for c in cells.values()):
+                other_hint = True
+            where = f"in the {BRACKETS[bracket]} bracket" if bracket else "in any deal-size bracket"
+            lines.append(f"- {name} [{sv}]: INSUFFICIENT DATA - fewer than {min_n} disclosed deals with {lab} "
+                         f"{where}, so no median is published{suffix}")
+            continue
+        any_data = True
+        lines.append(f"- {name} [{sv}]: " + "; ".join(parts) + suffix)
+    if other_hint:
+        lines.append(f"Some rows have no {lab} median but do have {dict(METRICS)[alt]}; call again with "
+                     f"metric={alt}.")
+    if any_data:
+        lines.append("These are population medians; a specific business's multiple depends on its margins, "
+                     "growth, customer concentration and owner dependence.")
+        lines.append(_source_line(ds))
+    lines += ["", cta()]
+    return "\n".join(lines)
+
+
+def _trend_cells(ty: dict, sv: str, metrics: list[str]) -> dict[str, dict]:
+    min_n = int(ty.get("min_n_per_cell", 10))
+    out: dict[str, dict] = {}
+    for yr, cell in sorted(((ty.get("data") or {}).get(sv) or {}).items()):
+        if not isinstance(cell, dict):
+            continue
+        row = {k: cell[k] for k in metrics
+               if isinstance(cell.get(k), dict) and cell[k].get("p50") is not None and (cell[k].get("n") or 0) >= min_n}
+        if row:
+            if cell.get("median_deal_value_m") is not None:
+                row["median_deal_value_m"] = cell["median_deal_value_m"]
+            out[str(yr)] = row
+    return out
+
+
+def get_multiples_trend(ty: dict, industry: str, metric: str | None = None) -> str:
+    """Year-by-year medians for one sub-vertical from multiples-by-year.json; gaps reported, never filled."""
+    query = str(industry or "").strip()[:100]
+    m = norm_metric(metric)
+    metrics = [m] if m else [k for k, _ in METRICS]
+    labels = dict(METRICS)
+    min_n = int(ty.get("min_n_per_cell", 10))
+    y0, y1 = (ty.get("year_range") or [2018, 2026])[:2]
+    kind, val = resolve(query)
+    if kind is None:
+        sugg = val or []
+        msg = f"No industry matched '{query}'."
+        if sugg:
+            msg += " Did you mean: " + ", ".join(f"{display_name(s)} [{s}]" for s in sugg) + "?"
+        return msg + " Call list_industries for all ids.\n\n" + cta()
+    if kind == "industry":
+        have = [sv for sv in INDUSTRY_TAXONOMY[val] if _trend_cells(ty, sv, metrics)]
+        return "\n".join([
+            f"{INDUSTRY_DISPLAY_NAMES[val]} is an industry group; year-by-year trends are published per "
+            "sub-vertical. Pass one of these ids:",
+            ", ".join(f"{display_name(s)} [{s}]" for s in have) if have else
+            f"(no sub-vertical in this industry has a year with n>={min_n} disclosed deals)",
+            "", cta()])
+    sv = val
+    name = display_name(sv)
+    lines = [f"{name} - M&A valuation multiples by deal year (ExitValue.ai)"]
+    note = _alias_note(query, sv)
+    if note:
+        lines.append(note)
+    cells = _trend_cells(ty, sv, metrics)
+    if not cells and sv in PARENT_CATEGORY:
+        p_sv, p_note = PARENT_CATEGORY[sv]
+        if _trend_cells(ty, p_sv, metrics):
+            cells = _trend_cells(ty, p_sv, metrics)
+            lines.append(f"Too few deals are tagged {name} on their own; figures below are for {p_note}.")
+    mlabel = labels[m] if m else "EV/EBITDA or EV/Revenue"
+    if not cells:
+        lines.append(f"The open dataset has no {name} year with at least n={min_n} disclosed deals ({y0}-{y1}), "
+                     f"so no year-by-year {mlabel} median is published (we do not extrapolate). "
+                     "get_valuation_multiples may still have pooled multi-year figures.")
+        return "\n".join(lines + ["", cta(sv)])
+    lines.append(f"Median by year the deal was announced (only years with n>={min_n} disclosed deals for a metric):")
+    years = [str(y) for y in range(int(y0), int(y1) + 1)]
+    for yr in years:
+        if yr not in cells:
+            continue
+        c = cells[yr]
+        dv = f" (median deal value ${c['median_deal_value_m']:,.0f}M)" if c.get("median_deal_value_m") else ""
+        lines.append(f"- {yr}{dv}: " + "; ".join(f"{labels[k]} {_fmt_q(c[k], k)}" for k in metrics if k in c))
+    for k in metrics:
+        missing = [y for y in years if k not in cells.get(y, {})]
+        if len(missing) == len(years):
+            lines.append(f"No year has {min_n}+ disclosed deals with {labels[k]}, so no {labels[k]} trend is "
+                         "published.")
+        elif missing:
+            lines.append(f"No published {labels[k]} median for {', '.join(missing)} (fewer than {min_n} disclosed "
+                         "deals that year); gaps are left empty, not estimated.")
+    lines.append("Year-to-year moves partly reflect which deals (and deal sizes) were disclosed each year, not "
+                 "only market pricing.")
+    lines += [_source_line(ty, TREND_URL), "", cta(sv)]
+    return "\n".join(lines)
+
+
+__all__ = ["Dataset", "list_industries", "get_valuation_multiples", "compare_industries",
+           "get_multiples_trend", "resolve", "published_cells", "calculator_url", "BRACKETS", "METRICS",
+           "DATA_URL", "TREND_URL"]
 

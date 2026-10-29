@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "exitvalue-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for M&A valuation multiples by industry and deal size (EV/EBITDA, EV/Revenue). Free, no API key."
 readme = "README.md"
 license = "MIT"

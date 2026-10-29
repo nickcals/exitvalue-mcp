@@ -3,7 +3,7 @@
 An MCP (Model Context Protocol) server that answers **"what multiple do businesses in industry X sell for?"** with real M&A data: median, 25th and 75th percentile **EV/EBITDA** and **EV/Revenue** multiples, by industry and deal size, from disclosed transactions (2018-2026).
 
 - Free, open source (MIT), **no API key, no telemetry**.
-- Data: the open [ExitValue.ai multiples dataset](https://exitvalue.ai/data/multiples.json) (CC-BY 4.0), fetched once and cached in memory for an hour.
+- Data: the open ExitValue.ai multiples dataset (CC-BY 4.0): [by deal size](https://exitvalue.ai/data/multiples.json) and [by deal year](https://exitvalue.ai/data/multiples-by-year.json), each fetched once and cached in memory for an hour.
 - Honest by design: every figure comes with its deal count (`n`); cells with fewer than the dataset's `min_cell_n` (10) disclosed deals are withheld, never extrapolated.
 - Works with Claude Desktop, Claude Code, Cursor, Windsurf, VS Code and any other MCP client (stdio transport).
 
@@ -11,10 +11,14 @@ An MCP (Model Context Protocol) server that answers **"what multiple do business
 
 ## Tools
 
-| Tool | What it does |
-|---|---|
-| `list_industries` | Lists industries and sub-vertical ids (dental practice, HVAC, SaaS, trucking, ...), marking which have published multiples. |
-| `get_valuation_multiples` | `industry` (id or plain English: "dentist", "med spa", "plumber", "MSP") and optional `size_bracket` (`under_5m_ev`, `5m_25m_ev`, `25m_100m_ev`, `100m_500m_ev`, `over_500m_ev`). Returns medians + interquartile range with `n` per enterprise-value bracket. |
+All tools are read-only (`readOnlyHint`, `idempotentHint`), take no credentials and return plain text ending with a link to the free calculator.
+
+| Tool | When to use it | Inputs | Output |
+|---|---|---|---|
+| `list_industries` | Find a valid id | none | Industries and sub-vertical ids (dental practice, HVAC, SaaS, trucking, ...), `*` marks those with published multiples |
+| `get_valuation_multiples` | "What multiple does X sell for?" (one industry) | `industry` (id or plain English: "dentist", "med spa", "plumber", "MSP"); optional `size_bracket` (`under_5m_ev`, `5m_25m_ev`, `25m_100m_ev`, `100m_500m_ev`, `over_500m_ev`) | Median + interquartile range with `n` per enterprise-value bracket |
+| `compare_industries` | "Which sells for more, X or Y?" | `industries` (2-6 ids/names); optional `size_bracket`; optional `metric` (`ev_ebitda` default, `ev_revenue`) | One row per industry: median, IQR and `n` per bracket; rows below the threshold are marked `INSUFFICIENT DATA` |
+| `get_multiples_trend` | "Are multiples rising or falling for X?" | `industry`; optional `metric` | Median, IQR and `n` per deal year 2018-2026 from [`multiples-by-year.json`](https://exitvalue.ai/data/multiples-by-year.json); years under n=10 are listed as gaps, never interpolated |
 
 ## Example
 
